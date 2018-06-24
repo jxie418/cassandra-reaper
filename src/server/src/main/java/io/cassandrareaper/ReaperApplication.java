@@ -19,6 +19,8 @@ import io.cassandrareaper.ReaperApplicationConfiguration.JmxCredentials;
 import io.cassandrareaper.jmx.JmxConnectionFactory;
 import io.cassandrareaper.jmx.JmxConnectionsInitializer;
 import io.cassandrareaper.resources.ClusterResource;
+import io.cassandrareaper.resources.DiagEventSseResource;
+import io.cassandrareaper.resources.DiagEventSubscriptionResource;
 import io.cassandrareaper.resources.PingResource;
 import io.cassandrareaper.resources.ReaperHealthCheck;
 import io.cassandrareaper.resources.RepairRunResource;
@@ -27,6 +29,7 @@ import io.cassandrareaper.resources.SnapshotResource;
 import io.cassandrareaper.resources.auth.LoginResource;
 import io.cassandrareaper.resources.auth.ShiroExceptionMapper;
 import io.cassandrareaper.service.AutoSchedulingManager;
+import io.cassandrareaper.service.DiagEventSubscriptionService;
 import io.cassandrareaper.service.PurgeManager;
 import io.cassandrareaper.service.RepairManager;
 import io.cassandrareaper.service.SchedulingManager;
@@ -54,15 +57,19 @@ import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Preconditions;
 import io.dropwizard.Application;
 import io.dropwizard.assets.AssetsBundle;
+import io.dropwizard.client.HttpClientBuilder;
 import io.dropwizard.configuration.EnvironmentVariableSubstitutor;
 import io.dropwizard.configuration.SubstitutingSourceProvider;
 import io.dropwizard.db.DataSourceFactory;
 import io.dropwizard.jdbi.DBIFactory;
+import io.dropwizard.jetty.BiDiGzipHandler;
 import io.dropwizard.setup.Bootstrap;
 import io.dropwizard.setup.Environment;
 import io.prometheus.client.CollectorRegistry;
 import io.prometheus.client.dropwizard.DropwizardExports;
 import io.prometheus.client.exporter.MetricsServlet;
+import org.apache.http.client.HttpClient;
+import org.eclipse.jetty.server.Handler;
 import org.eclipse.jetty.server.session.SessionHandler;
 import org.eclipse.jetty.servlets.CrossOriginFilter;
 import org.flywaydb.core.Flyway;
@@ -201,6 +208,11 @@ public final class ReaperApplication extends Application<ReaperApplicationConfig
       context.jmxConnectionFactory.setJmxCredentials(jmxCredentials);
     }
 
+    HttpClient httpClient = new HttpClientBuilder(environment).using(config.getHttpClientConfiguration())
+            .build(getName());
+    context.httpClient = httpClient;
+    context.diagEventService = DiagEventSubscriptionService.create(context);
+
     // Enable cross-origin requests for using external GUI applications.
     if (config.isEnableCrossOrigin() || System.getProperty("enableCrossOrigin") != null) {
       final FilterRegistration.Dynamic cors
@@ -210,6 +222,13 @@ public final class ReaperApplication extends Application<ReaperApplicationConfig
       cors.setInitParameter("allowedMethods", "OPTIONS,GET,PUT,POST,DELETE,HEAD");
       cors.addMappingForUrlPatterns(EnumSet.allOf(DispatcherType.class), true, "/*");
     }
+
+    // Enabling gzip buffering will prevent flushing of server-side-events, so we disable compression for SSE
+    environment.lifecycle().addServerLifecycleListener(server -> {
+      for (Handler handler : server.getChildHandlersByClass(BiDiGzipHandler.class)) {
+        ((BiDiGzipHandler) handler).addExcludedMimeTypes("text/event-stream");
+      }
+    });
 
     LOG.info("creating and registering health checks");
     // Notice that health checks are registered under the admin application on /healthcheck
@@ -228,6 +247,9 @@ public final class ReaperApplication extends Application<ReaperApplicationConfig
     final SnapshotResource snapshotResource = new SnapshotResource(context);
     environment.jersey().register(snapshotResource);
 
+    final DiagEventSubscriptionResource eventsResource = new DiagEventSubscriptionResource(context);
+    environment.jersey().register(eventsResource);
+
     if (config.isAccessControlEnabled()) {
       SessionHandler sessionHandler = new SessionHandler();
       sessionHandler.setMaxInactiveInterval((int) config.getAccessControl().getSessionTimeout().getSeconds());
@@ -236,6 +258,9 @@ public final class ReaperApplication extends Application<ReaperApplicationConfig
       environment.jersey().register(new ShiroExceptionMapper());
       environment.jersey().register(new LoginResource(context));
     }
+
+    final DiagEventSseResource diagEvents = new DiagEventSseResource(context);
+    environment.jersey().register(diagEvents);
 
     Thread.sleep(1000);
     SchedulingManager.start(context);

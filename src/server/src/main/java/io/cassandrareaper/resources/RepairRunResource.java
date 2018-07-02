@@ -104,7 +104,8 @@ public final class RepairRunResource {
       @QueryParam("nodes") Optional<String> nodesToRepairParam,
       @QueryParam("datacenters") Optional<String> datacentersToRepairParam,
       @QueryParam("blacklistedTables") Optional<String> blacklistedTableNamesParam,
-      @QueryParam("repairThreadCount") Optional<Integer> repairThreadCountParam) {
+      @QueryParam("repairThreadCount") Optional<Integer> repairThreadCountParam,
+      @QueryParam("majorCompaction") Optional<String> majorCompactionParam) {
 
     try {
       final Response possibleFailedResponse
@@ -236,7 +237,8 @@ public final class RepairRunResource {
               0,
               segments,
               parallelism,
-              intensity);
+              intensity,
+              majorCompactionParam.isPresent() ? Boolean.parseBoolean(majorCompactionParam.get()) : false);
 
       return Response.created(buildRepairRunUri(uriInfo, newRepairRun))
           .entity(new RepairRunStatus(newRepairRun, theRepairUnit, 0))

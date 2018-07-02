@@ -1135,4 +1135,12 @@ final class JmxProxyImpl implements JmxProxy {
       throw new ReaperException(e);
     }
   }
+
+  StorageServiceMBean getStorageServiceMBean() {
+    return (StorageServiceMBean)ssProxy;
+  }
+
+  MBeanServerConnection getMBeanServerConnection() {
+    return mbeanServer;
+  }
 }

@@ -14,7 +14,6 @@
 
 package io.cassandrareaper.acceptance;
 
-import io.cassandrareaper.AppContext;
 import io.cassandrareaper.SimpleReaperClient;
 import io.cassandrareaper.core.RepairRun;
 import io.cassandrareaper.core.RepairSegment;
@@ -28,11 +27,13 @@ import java.util.Arrays;
 import java.util.EnumSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Random;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.stream.Collectors;
 
 import javax.ws.rs.core.Response;
@@ -41,12 +42,10 @@ import com.datastax.driver.core.Cluster;
 import com.datastax.driver.core.Host;
 import com.datastax.driver.core.Session;
 import com.datastax.driver.core.SocketOptions;
-import com.google.common.base.Optional;
 import com.google.common.base.Preconditions;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.Maps;
 import com.google.common.collect.Sets;
-import cucumber.api.java.Before;
 import cucumber.api.java.en.And;
 import cucumber.api.java.en.Given;
 import cucumber.api.java.en.Then;
@@ -68,13 +67,14 @@ import static org.junit.Assert.assertTrue;
 public final class BasicSteps {
 
   private static final Logger LOG = LoggerFactory.getLogger(BasicSteps.class);
-  private static final Optional<Map<String, String>> EMPTY_PARAMS = Optional.absent();
-  private static final String MEMORY_CONFIG_FILE = "cassandra-reaper-at.yaml";
+  private static final Optional<Map<String, String>> EMPTY_PARAMS = Optional.empty();
 
   private static final List<ReaperTestJettyRunner> RUNNERS = new CopyOnWriteArrayList<>();
   private static final List<SimpleReaperClient> CLIENTS = new CopyOnWriteArrayList<>();
   private static final Random RAND = new Random(System.nanoTime());
+  private static final AtomicReference<Upgradable> TEST_INSTANCE = new AtomicReference<>();
 
+  private Optional<String> reaperVersion = Optional.empty();
   private Response lastResponse;
 
   public static synchronized void addReaperRunner(ReaperTestJettyRunner runner) {
@@ -94,21 +94,9 @@ public final class BasicSteps {
     RUNNERS.remove(runner);
   }
 
-  @Before
-  public static void setup() {
-    // actual setup is done in setupReaperTestRunner step
-  }
-
-  private void setupReaperIntegrationTestRunner() throws Exception {
-    if (CLIENTS.isEmpty()) {
-      assert RUNNERS.isEmpty();
-      LOG.info("setting up testing Reaper runner with {} seed hosts defined",
-          TestContext.TEST_CLUSTER_SEED_HOSTS.size());
-      AppContext context = new AppContext();
-      ReaperTestJettyRunner runner = new ReaperTestJettyRunner();
-      runner.setup(context, MEMORY_CONFIG_FILE);
-      addReaperRunner(runner);
-    }
+  static void setup(Upgradable testInstance) {
+    Preconditions.checkState(null == TEST_INSTANCE.get());
+    TEST_INSTANCE.set(testInstance);
   }
 
   private static void callAndExpect(
@@ -142,7 +130,7 @@ public final class BasicSteps {
             // rest command requests should not response with bodies, follow the location to GET that
             Assertions.assertThat(responseEntity).isEmpty();
             // follow to new location (to GET resource)
-            response = runner.callReaper("GET", response.getLocation().toString(), Optional.absent());
+            response = runner.callReaper("GET", response.getLocation().toString(), Optional.empty());
             responseEntity = response.readEntity(String.class);
           } else if ("DELETE".equals(httpMethod)) {
             throw new IllegalArgumentException("tests can't expect response body from DELETE request");
@@ -155,24 +143,6 @@ public final class BasicSteps {
         }
       }
     });
-  }
-
-  @Given("^a real reaper service is running$")
-  public void a_real_reaper_service_is_running() throws Throwable {
-    synchronized (BasicSteps.class) {
-      setupReaperIntegrationTestRunner();
-      callAndExpect(
-          "GET",
-          "/ping",
-          Optional.<Map<String, String>>absent(),
-          Optional.<String>absent(),
-          Response.Status.OK);
-    }
-  }
-
-  @Given("^a reaper service with access control enabled is running$")
-  public void a_reaper_service_with_access_control_enabled_is_running() throws Throwable {
-    a_real_reaper_service_is_running();
   }
 
   @Given("^cluster seed host \"([^\"]*)\" points to cluster with name \"([^\"]*)\"$")
@@ -200,12 +170,33 @@ public final class BasicSteps {
     }
   }
 
+  @Given("^that reaper ([^\"]*) is running$")
+  public void start_reaper(String version) throws Throwable {
+    synchronized (BasicSteps.class) {
+      Optional<String> newVersion = version.trim().isEmpty() ? Optional.empty() : Optional.of(version);
+      if (RUNNERS.isEmpty() || !newVersion.equals(reaperVersion)) {
+        reaperVersion = newVersion;
+        TEST_INSTANCE.get().upgradeReaperRunner(reaperVersion);
+      }
+    }
+  }
+
+  @When("^reaper is upgraded to latest$")
+  public void upgrade_reaper() throws Throwable {
+    synchronized (BasicSteps.class) {
+      if (reaperVersion.isPresent()) {
+        reaperVersion = Optional.empty();
+        TEST_INSTANCE.get().upgradeReaperRunner(Optional.empty());
+      }
+    }
+  }
+
   @And("^reaper has no cluster with name \"([^\"]*)\" in storage$")
   public void reaper_has_no_cluster_with_name_in_storage(String clusterName) throws Throwable {
     synchronized (BasicSteps.class) {
       callAndExpect("GET", "/cluster/" + clusterName,
-          Optional.<Map<String, String>>absent(),
-          Optional.<String>absent(), Response.Status.NOT_FOUND);
+          Optional.<Map<String, String>>empty(),
+          Optional.<String>empty(), Response.Status.NOT_FOUND);
     }
   }
 
@@ -213,7 +204,7 @@ public final class BasicSteps {
   public void reaper_has_no_cluster_in_storage() throws Throwable {
     synchronized (BasicSteps.class) {
       RUNNERS.parallelStream().forEach(runner -> {
-        Response response = runner.callReaper("GET", "/cluster/", Optional.<Map<String, String>>absent());
+        Response response = runner.callReaper("GET", "/cluster/", Optional.<Map<String, String>>empty());
         assertEquals(Response.Status.OK.getStatusCode(), response.getStatus());
         String responseData = response.readEntity(String.class);
         List<String> clusterNames = SimpleReaperClient.parseClusterNameListJSON(responseData);
@@ -248,7 +239,7 @@ public final class BasicSteps {
                 Assertions.assertThat(responseEntity).isEmpty();
 
                 // follow to new location (to GET resource)
-                response = runner.callReaper("GET", response.getLocation().toString(), Optional.absent());
+                response = runner.callReaper("GET", response.getLocation().toString(), Optional.empty());
 
                 String responseData = response.readEntity(String.class);
                 Assertions.assertThat(responseData).isNotEmpty();
@@ -262,8 +253,8 @@ public final class BasicSteps {
       callAndExpect(
           "GET",
           "/cluster/" + TestContext.TEST_CLUSTER,
-          Optional.<Map<String, String>>absent(),
-          Optional.<String>absent(),
+          Optional.<Map<String, String>>empty(),
+          Optional.<String>empty(),
           Response.Status.OK);
     }
   }
@@ -272,8 +263,8 @@ public final class BasicSteps {
   public void reaper_has_a_cluster_called_in_storage(String clusterName) throws Throwable {
     synchronized (BasicSteps.class) {
       callAndExpect("GET", "/cluster/" + clusterName,
-          Optional.<Map<String, String>>absent(),
-          Optional.<String>absent(), Response.Status.OK);
+          Optional.<Map<String, String>>empty(),
+          Optional.<String>empty(), Response.Status.OK);
     }
   }
 
@@ -281,8 +272,8 @@ public final class BasicSteps {
   public void reaper_has_the_last_added_cluster_in_storage() throws Throwable {
     synchronized (BasicSteps.class) {
       callAndExpect("GET", "/cluster/" + TestContext.TEST_CLUSTER,
-          Optional.<Map<String, String>>absent(),
-          Optional.<String>absent(), Response.Status.OK);
+          Optional.<Map<String, String>>empty(),
+          Optional.<String>empty(), Response.Status.OK);
     }
   }
 
@@ -290,7 +281,7 @@ public final class BasicSteps {
   public void reaper_has_no_scheduled_repairs_for(String clusterName) throws Throwable {
     synchronized (BasicSteps.class) {
       callAndExpect("GET", "/repair_schedule/cluster/" + clusterName,
-          Optional.<Map<String, String>>absent(),
+          Optional.<Map<String, String>>empty(),
           Optional.of("[]"), Response.Status.OK);
     }
   }
@@ -324,7 +315,7 @@ public final class BasicSteps {
       Assertions.assertThat(responseEntity).isEmpty();
 
       // follow to new location (to GET resource)
-      response = runner.callReaper("GET", response.getLocation().toString(), Optional.absent());
+      response = runner.callReaper("GET", response.getLocation().toString(), Optional.empty());
       String responseData = response.readEntity(String.class);
       RepairScheduleStatus schedule = SimpleReaperClient.parseRepairScheduleStatusJSON(responseData);
 
@@ -377,7 +368,7 @@ public final class BasicSteps {
       Assertions.assertThat(responseEntity).isEmpty();
 
       // follow to new location (to GET resource)
-      response = runner.callReaper("GET", response.getLocation().toString(), Optional.absent());
+      response = runner.callReaper("GET", response.getLocation().toString(), Optional.empty());
       String responseData = response.readEntity(String.class);
       RepairScheduleStatus schedule = SimpleReaperClient.parseRepairScheduleStatusJSON(responseData);
 
@@ -435,7 +426,7 @@ public final class BasicSteps {
       }
 
       // follow to new location (to GET resource)
-      response = runner.callReaper("GET", response.getLocation().toString(), Optional.absent());
+      response = runner.callReaper("GET", response.getLocation().toString(), Optional.empty());
       String responseData = response.readEntity(String.class);
       RepairScheduleStatus schedule = SimpleReaperClient.parseRepairScheduleStatusJSON(responseData);
 
@@ -513,7 +504,7 @@ public final class BasicSteps {
       // rest command requests should not response with bodies, follow the location to GET that
       Assertions.assertThat(response.readEntity(String.class)).isEmpty();
       // follow to new location (to GET resource)
-      response = runner.callReaper("GET", response.getLocation().toString(), Optional.absent());
+      response = runner.callReaper("GET", response.getLocation().toString(), Optional.empty());
       String responseData = response.readEntity(String.class);
       RepairScheduleStatus schedule = SimpleReaperClient.parseRepairScheduleStatusJSON(responseData);
       TestContext.LAST_MODIFIED_ID = schedule.getId();
@@ -583,7 +574,7 @@ public final class BasicSteps {
       callAndExpect("DELETE",
           "/repair_schedule/" + TestContext.LAST_MODIFIED_ID,
           Optional.of(params),
-          Optional.absent(),
+          Optional.empty(),
           Response.Status.ACCEPTED,
           Response.Status.NOT_FOUND);
 
@@ -593,7 +584,7 @@ public final class BasicSteps {
               "DELETE",
               "/repair_schedule/" + TestContext.LAST_MODIFIED_ID,
               Optional.of(params),
-              Optional.absent(),
+              Optional.empty(),
               Response.Status.NOT_FOUND);
         } catch (AssertionError ex) {
           LOG.warn(ex.getMessage());
@@ -627,7 +618,7 @@ public final class BasicSteps {
           "DELETE",
           "/repair_schedule/" + TestContext.LAST_MODIFIED_ID,
           Optional.of(params),
-          Optional.absent(),
+          Optional.empty(),
           Response.Status.ACCEPTED,
           Response.Status.NOT_FOUND);
 
@@ -637,7 +628,7 @@ public final class BasicSteps {
               "DELETE",
               "/repair_schedule/" + TestContext.LAST_MODIFIED_ID,
               Optional.of(params),
-              Optional.absent(),
+              Optional.empty(),
               Response.Status.NOT_FOUND);
         } catch (AssertionError ex) {
           LOG.warn(ex.getMessage());
@@ -671,7 +662,7 @@ public final class BasicSteps {
             "PUT",
             "/repair_schedule/" + schedule.getId(),
             Optional.of(params),
-            Optional.absent(),
+            Optional.empty(),
             Response.Status.OK,
             Response.Status.NO_CONTENT,
             Response.Status.NOT_FOUND);
@@ -686,7 +677,7 @@ public final class BasicSteps {
             "DELETE",
             "/repair_schedule/" + schedule.getId(),
             Optional.of(params),
-            Optional.absent(),
+            Optional.empty(),
             Response.Status.ACCEPTED,
             Response.Status.NOT_FOUND);
 
@@ -696,7 +687,7 @@ public final class BasicSteps {
                 "DELETE",
                 "/repair_schedule/" + schedule.getId(),
                 Optional.of(params),
-                Optional.absent(),
+                Optional.empty(),
                 Response.Status.NOT_FOUND);
             return true;
           } catch (AssertionError ex) {
@@ -715,7 +706,7 @@ public final class BasicSteps {
           "DELETE",
           "/cluster/" + clusterName,
           EMPTY_PARAMS,
-          Optional.absent(),
+          Optional.empty(),
           Response.Status.CONFLICT);
     }
   }
@@ -727,7 +718,7 @@ public final class BasicSteps {
           "DELETE",
           "/cluster/" + TestContext.TEST_CLUSTER,
           EMPTY_PARAMS,
-          Optional.absent(),
+          Optional.empty(),
           Response.Status.CONFLICT);
     }
   }
@@ -739,7 +730,7 @@ public final class BasicSteps {
           "DELETE",
           "/cluster/" + clusterName,
           EMPTY_PARAMS,
-          Optional.<String>absent(),
+          Optional.<String>empty(),
           Response.Status.ACCEPTED,
           Response.Status.NOT_FOUND);
 
@@ -749,7 +740,7 @@ public final class BasicSteps {
               "GET",
               "/cluster/" + clusterName,
               EMPTY_PARAMS,
-              Optional.<String>absent(),
+              Optional.<String>empty(),
               Response.Status.NOT_FOUND);
         } catch (AssertionError ex) {
           LOG.warn(ex.getMessage());
@@ -767,7 +758,7 @@ public final class BasicSteps {
           "DELETE",
           "/cluster/" + TestContext.TEST_CLUSTER,
           EMPTY_PARAMS,
-          Optional.<String>absent(),
+          Optional.<String>empty(),
           Response.Status.ACCEPTED,
           Response.Status.NOT_FOUND);
 
@@ -777,7 +768,7 @@ public final class BasicSteps {
               "GET",
               "/cluster/" + TestContext.TEST_CLUSTER,
               EMPTY_PARAMS,
-              Optional.<String>absent(),
+              Optional.<String>empty(),
               Response.Status.NOT_FOUND);
         } catch (AssertionError ex) {
           LOG.warn(ex.getMessage());
@@ -794,8 +785,8 @@ public final class BasicSteps {
       callAndExpect(
           "GET",
           "/cluster/" + clusterName,
-          Optional.<Map<String, String>>absent(),
-          Optional.<String>absent(),
+          Optional.<Map<String, String>>empty(),
+          Optional.<String>empty(),
           Response.Status.NOT_FOUND);
     }
   }
@@ -806,8 +797,8 @@ public final class BasicSteps {
       callAndExpect(
           "GET",
           "/cluster/" + TestContext.TEST_CLUSTER,
-          Optional.<Map<String, String>>absent(),
-          Optional.<String>absent(),
+          Optional.<Map<String, String>>empty(),
+          Optional.<String>empty(),
           Response.Status.NOT_FOUND);
     }
   }
@@ -996,7 +987,7 @@ public final class BasicSteps {
           "DELETE",
           "/repair_run/" + TestContext.LAST_MODIFIED_ID,
           Optional.of(params),
-          Optional.absent(),
+          Optional.empty(),
           Response.Status.ACCEPTED,
           Response.Status.NOT_FOUND,
           Response.Status.CONFLICT);
@@ -1007,7 +998,7 @@ public final class BasicSteps {
               "DELETE",
               "/repair_run/" + TestContext.LAST_MODIFIED_ID,
               Optional.of(params),
-              Optional.absent(),
+              Optional.empty(),
               Response.Status.NOT_FOUND);
         } catch (AssertionError ex) {
           LOG.warn(ex.getMessage());
@@ -1049,7 +1040,7 @@ public final class BasicSteps {
             "DELETE",
             "/repair_run/" + id,
             Optional.of(params),
-            Optional.absent(),
+            Optional.empty(),
             Response.Status.ACCEPTED,
             Response.Status.NOT_FOUND,
             Response.Status.CONFLICT);
@@ -1060,7 +1051,7 @@ public final class BasicSteps {
                 "DELETE",
                 "/repair_run/" + id,
                 Optional.of(params),
-                Optional.absent(),
+                Optional.empty(),
                 Response.Status.NOT_FOUND);
           } catch (AssertionError ex) {
             LOG.warn(ex.getMessage());
@@ -1125,7 +1116,7 @@ public final class BasicSteps {
         Assertions.assertThat(responseEntity).isEmpty();
 
         // follow to new location (to GET resource)
-        response = runner.callReaper("GET", response.getLocation().toString(), Optional.absent());
+        response = runner.callReaper("GET", response.getLocation().toString(), Optional.empty());
 
         if (Response.Status.OK.getStatusCode() == status) {
           String responseData = response.readEntity(String.class);
@@ -1139,8 +1130,8 @@ public final class BasicSteps {
       callAndExpect(
           "PUT",
           "/repair_run/" + TestContext.LAST_MODIFIED_ID + "/state/RUNNING",
-          Optional.absent(),
-          Optional.absent(),
+          Optional.empty(),
+          Optional.empty(),
           Response.Status.NO_CONTENT);
     }
   }
@@ -1182,8 +1173,8 @@ public final class BasicSteps {
     callAndExpect(
         "PUT",
         "/repair_run/" + repairRunId + "/state/PAUSED",
-        Optional.absent(),
-        Optional.absent(),
+        Optional.empty(),
+        Optional.empty(),
         Response.Status.NO_CONTENT,
         Response.Status.CONFLICT);
   }
@@ -1363,8 +1354,8 @@ public final class BasicSteps {
                 callAndExpect(
                     "DELETE",
                     "/snapshot/cluster/" + TestContext.TEST_CLUSTER + "/" + snapshot,
-                    Optional.absent(),
-                    Optional.absent(),
+                    Optional.empty(),
+                    Optional.empty(),
                     Response.Status.ACCEPTED,
                     Response.Status.NOT_FOUND);
               });
@@ -1405,8 +1396,8 @@ public final class BasicSteps {
                 callAndExpect(
                     "DELETE",
                     "/snapshot/" + TestContext.TEST_CLUSTER + "/" + TestContext.SEED_HOST + "/" + snapshot,
-                    Optional.absent(),
-                    Optional.absent(),
+                    Optional.empty(),
+                    Optional.empty(),
                     Response.Status.ACCEPTED,
                     Response.Status.NOT_FOUND);
               });

@@ -14,6 +14,9 @@
 
 package io.cassandrareaper;
 
+import java.nio.file.Paths;
+
+import org.fest.assertions.api.Assertions;
 import org.junit.Test;
 
 public final class AssertionTest {
@@ -28,6 +31,21 @@ public final class AssertionTest {
     }
     if (!asserted) {
       throw new AssertionError("assertions are not enabled");
+    }
+  }
+
+  @Test
+  public void test_versions_downloaded() {
+    String[] versions = System.getProperty("cucumber.versions-to-test").split("\n");
+    for (String line : versions) {
+      if (!(line.contains("Examples") || line.contains("version"))) {
+        String version = line.replace("|", "").trim();
+        if (!version.isEmpty()) {
+          Assertions
+            .assertThat(Paths.get("test-jars", String.format("cassandra-reaper-%s.jar", version)).toFile())
+            .exists();
+        }
+      }
     }
   }
 
